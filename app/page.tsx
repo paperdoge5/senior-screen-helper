@@ -3,6 +3,16 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { classifyUserQuestion } from "@/lib/question-scope";
 
+type SpeechRecognition = any;
+type SpeechRecognitionEvent = any;
+
+declare global {
+  interface Window {
+    SpeechRecognition?: any;
+    webkitSpeechRecognition?: any;
+  }
+}
+
 const EXAMPLE_QUESTIONS = [
   "What am I looking at?",
   "How do I call someone?",
@@ -750,7 +760,7 @@ export default function Home() {
     if (mode === "guiding") {
       setCurrentStep(complete ? null : data.answer);
     } else if (mode === "stuck" || mode === "still_stuck") {
-      setClarificationHistory((prev) => [...prev, data.answer]);
+      setClarificationHistory((prev) => [...prev, data.answer ?? ""]);
     }
     setHelpResponse(data.answer);
     setIsStepComplete(complete);
@@ -1110,14 +1120,14 @@ export default function Home() {
     void fetchStuckHelp("still_stuck");
   }
 
-  function handlePlayAudio() {
+  function handleRepeatStep() {
     const textToRead = helpResponse ?? currentStep;
     if (textToRead && textToRead !== "Thinking...") {
       speakSingleStep(textToRead);
     }
   }
 
-  function handleStopAudio() {
+  function handleStopVoice() {
     stopSpeech();
   }
 
@@ -1314,24 +1324,6 @@ export default function Home() {
                   : "❓ I'm Stuck"}
               </button>
             )}
-            <div className="rounded-2xl border-2 border-violet-300 bg-violet-50 p-4">
-              <button
-                type="button"
-                onClick={handlePlayAudio}
-                disabled={isHelpLoading}
-                title="Hear this instruction again."
-                aria-describedby="play-audio-help"
-                className="flex min-h-[64px] w-full items-center justify-center gap-2 rounded-xl border-2 border-violet-500 bg-white px-4 py-4 text-[22px] font-bold text-violet-800 transition hover:bg-violet-100 focus:outline-none focus-visible:ring-4 focus-visible:ring-violet-300 disabled:opacity-50 sm:text-[24px]"
-              >
-                🔊 Play Audio
-              </button>
-              <p
-                id="play-audio-help"
-                className="mt-2 text-center text-[18px] text-violet-900 sm:text-[20px]"
-              >
-                Hear this instruction again.
-              </p>
-            </div>
             <button
               type="button"
               onClick={handleShowHumanHelp}
@@ -1349,11 +1341,18 @@ export default function Home() {
             </button>
             <button
               type="button"
-              onClick={handleStopAudio}
-              title="Stop the spoken instruction."
-              className="flex min-h-[64px] items-center justify-center gap-2 rounded-2xl border-2 border-slate-400 bg-slate-100 px-4 py-4 text-[20px] font-semibold text-slate-800 transition hover:bg-slate-200 focus:outline-none focus-visible:ring-4 focus-visible:ring-slate-300 sm:text-[22px]"
+              onClick={handleRepeatStep}
+              disabled={isHelpLoading}
+              className="flex min-h-[64px] items-center justify-center gap-2 rounded-2xl border-2 border-blue-600 bg-white px-4 py-4 text-xl font-semibold text-blue-700 transition hover:bg-blue-50 focus:outline-none focus-visible:ring-4 focus-visible:ring-blue-300 disabled:opacity-50 sm:text-2xl"
             >
-              ⏹ Stop Audio
+              🔁 Repeat step
+            </button>
+            <button
+              type="button"
+              onClick={handleStopVoice}
+              className="flex min-h-[64px] items-center justify-center gap-2 rounded-2xl border-2 border-slate-400 bg-white px-4 py-4 text-xl font-semibold text-slate-700 transition hover:bg-slate-50 focus:outline-none focus-visible:ring-4 focus-visible:ring-slate-300 sm:text-2xl"
+            >
+              🛑 Stop
             </button>
           </div>
         )}
