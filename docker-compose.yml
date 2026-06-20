@@ -1,0 +1,11 @@
+services:
+  senior-screen-helper:
+    image: senior-screen-helper
+    build: .
+    container_name: senior-screen-helper
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      OLLAMA_BASE_URL: http://192.168.1.172:11434
+      OLLAMA_MODEL: gemma4:e4b
