@@ -178,6 +178,65 @@ function parseTarget(raw: unknown): HighlightTarget | null {
   };
 }
 
+function sentenceCase(text: string): string {
+  const trimmed = text.trim().replace(/\s+/g, " ");
+  if (!trimmed) return "";
+
+  const withPunctuation = /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+  return withPunctuation.charAt(0).toUpperCase() + withPunctuation.slice(1);
+}
+
+function extractInstructionFromReasoning(raw: string): string | null {
+  const cleaned = raw.replace(/\*\*/g, "").replace(/\s+/g, " ").trim();
+  const directInstruction = cleaned.match(
+    /(?:final answer|final response|user instruction)\s*[:\-]\s*([^.!?]+[.!?]?)/i
+  )?.[1];
+
+  if (directInstruction && !/analy[sz]e|review|determine|thinking/i.test(directInstruction)) {
+    return sentenceCase(directInstruction);
+  }
+
+  const lastLabel = [
+    ...cleaned.matchAll(
+      /(?:app|icon|button|menu item|item)\s+(?:labeled|labelled|called|named)\s+["']([^"']+)["']/gi
+    ),
+  ].at(-1)?.[1];
+  const inferredTap = cleaned.match(
+    /(?:I should|should)\s+instruct\s+(?:the user|them)\s+to\s+tap\s+(?:it|this|the icon|the app)/i
+  );
+
+  if (inferredTap && lastLabel) {
+    return sentenceCase(`Tap the ${lastLabel} app`);
+  }
+
+  const instructedAction = cleaned.match(
+    /(?:I should|should)\s+instruct\s+(?:the user|them)\s+to\s+([^.!?]+[.!?]?)/i
+  )?.[1];
+
+  if (instructedAction) {
+    return sentenceCase(instructedAction);
+  }
+
+  return null;
+}
+
+function sanitizePlainStep(raw: string): string {
+  const trimmed = raw.trim();
+  const looksLikeReasoning =
+    /thinking process|analy[sz]e the request|review session memory|determine the next action|final check/i.test(
+      trimmed
+    );
+
+  if (!looksLikeReasoning) {
+    return trimmed;
+  }
+
+  return (
+    extractInstructionFromReasoning(trimmed) ??
+    "I need a clearer screen update before giving the next step."
+  );
+}
+
 function parseStepResponse(raw: string): {
   step: string;
   isComplete: boolean;
@@ -208,7 +267,7 @@ function parseStepResponse(raw: string): {
   const isComplete = /all done|successfully completed|you'?re ready|task complete/i.test(
     trimmed
   );
-  return { step: trimmed, isComplete, target: null };
+  return { step: sanitizePlainStep(trimmed), isComplete, target: null };
 }
 
 function getCompletionText(
