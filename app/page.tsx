@@ -1272,10 +1272,10 @@ export default function Home() {
 
   function renderScreenSummaryBox() {
     if (!screenshotPreview) return null;
+    if (isStepMode || helpResponse || isHelpLoading) return null;
     if (!isLoadingScreenSummary && !screenSummary) return null;
 
-    const showHelpPrompt =
-      !question.trim() && !isStepMode && !helpResponse && !isHelpLoading;
+    const showHelpPrompt = !question.trim();
 
     return (
       <div

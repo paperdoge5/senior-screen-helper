@@ -229,6 +229,19 @@ function getCompletionText(
   return "";
 }
 
+function sanitizeScreenSummary(raw: string): string {
+  const withoutReasoning = raw
+    .replace(/^(thinking process|analysis|reasoning)\s*:\s*/i, "")
+    .replace(/\*\*/g, "")
+    .trim();
+  const firstVisibleSummary =
+    withoutReasoning.match(/I can see[^.?!]*(?:[.?!]|$)/i)?.[0] ??
+    withoutReasoning.split(/\n|(?<=\.)\s+/)[0] ??
+    "";
+
+  return firstVisibleSummary.trim();
+}
+
 function logModelTiming({
   mode,
   model,
@@ -419,7 +432,7 @@ export async function POST(request: Request) {
         ],
       });
 
-      const summary = getCompletionText(completion);
+      const summary = sanitizeScreenSummary(getCompletionText(completion));
       logModelTiming({
         mode: "screen_summary",
         model: OLLAMA_MODEL,
