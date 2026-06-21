@@ -229,6 +229,28 @@ function getCompletionText(
   return "";
 }
 
+function logModelTiming({
+  mode,
+  model,
+  hasImage,
+  startedAt,
+  status,
+}: {
+  mode: string;
+  model: string;
+  hasImage: boolean;
+  startedAt: number;
+  status: "success" | "empty";
+}) {
+  console.info("Analyze model request", {
+    mode,
+    model,
+    hasImage,
+    status,
+    durationMs: Date.now() - startedAt,
+  });
+}
+
 function buildStepModeUserText(
   question: string,
   stepHistory: string[],
@@ -377,6 +399,7 @@ export async function POST(request: Request) {
         );
       }
 
+      const summaryStartedAt = Date.now();
       const completion = await ollama.chat.completions.create({
         model: OLLAMA_MODEL,
         temperature: MODEL_TEMPERATURE,
@@ -397,6 +420,13 @@ export async function POST(request: Request) {
       });
 
       const summary = getCompletionText(completion);
+      logModelTiming({
+        mode: "screen_summary",
+        model: OLLAMA_MODEL,
+        hasImage: true,
+        startedAt: summaryStartedAt,
+        status: summary ? "success" : "empty",
+      });
       if (!summary) {
         console.error("Empty screen-summary completion", {
           model: OLLAMA_MODEL,
@@ -509,6 +539,14 @@ export async function POST(request: Request) {
     }
 
     const selectedModel = isStuck && !hasImage ? OLLAMA_TEXT_MODEL : OLLAMA_MODEL;
+    const analyzeMode = inStepMode
+      ? isStuck
+        ? isStillStuck
+          ? "still_stuck"
+          : "stuck"
+        : "step"
+      : "general";
+    const analyzeStartedAt = Date.now();
     const completion = await ollama.chat.completions.create({
       model: selectedModel,
       temperature: MODEL_TEMPERATURE,
@@ -520,6 +558,13 @@ export async function POST(request: Request) {
     });
 
     const rawAnswer = getCompletionText(completion);
+    logModelTiming({
+      mode: analyzeMode,
+      model: selectedModel,
+      hasImage,
+      startedAt: analyzeStartedAt,
+      status: rawAnswer ? "success" : "empty",
+    });
     if (!rawAnswer) {
       console.error("Empty analyze completion", {
         model: selectedModel,
