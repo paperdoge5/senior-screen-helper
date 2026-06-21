@@ -82,6 +82,20 @@ Break the SAME action into even smaller pieces with target box for the same elem
 Respond with valid JSON only:
 {"step":"your clarification here","isComplete":false,"target":{...}}`;
 
+const TEXT_ONLY_STUCK_PROMPT = `You are a patient grandchild helping a grandparent use their phone.
+
+The user is stuck on the CURRENT step. Do NOT advance to the next step.
+Do NOT restart the task or repeat completed steps.
+
+Re-explain the SAME step only, in easier plain English.
+- Start with "No problem" or "Take your time."
+- Keep it short: 2-3 sentences.
+- If target details are provided, refer to the red circle and the target location.
+- Do NOT invent new screen details.
+
+Respond with valid JSON only:
+{"step":"your clarification here","isComplete":false,"target":null}`;
+
 const SCREEN_SUMMARY_PROMPT = `${SCREEN_AWARE_RULES}
 
 AUTOMATIC SCREEN SUMMARY — context only, NO instructions.
@@ -105,6 +119,10 @@ Respond with plain text only — one short sentence.`;
 const OLLAMA_BASE_URL =
   process.env.OLLAMA_BASE_URL ?? "http://greyflow-ai:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "gemma4:e4b";
+const OLLAMA_TEXT_MODEL = process.env.OLLAMA_TEXT_MODEL ?? "gemma3:4b";
+const MODEL_TEMPERATURE = 0.1;
+const SUMMARY_MAX_TOKENS = 60;
+const STEP_MAX_TOKENS = 512;
 
 export type HighlightTarget = {
   name: string;
@@ -193,6 +211,24 @@ function parseStepResponse(raw: string): {
   return { step: trimmed, isComplete, target: null };
 }
 
+function getCompletionText(
+  completion: OpenAI.Chat.Completions.ChatCompletion
+): string {
+  const message = completion.choices[0]?.message as
+    | (OpenAI.Chat.Completions.ChatCompletionMessage & {
+        reasoning?: unknown;
+      })
+    | undefined;
+  const content = message?.content;
+  if (typeof content === "string" && content.trim()) {
+    return content.trim();
+  }
+  if (typeof message?.reasoning === "string" && message.reasoning.trim()) {
+    return message.reasoning.trim();
+  }
+  return "";
+}
+
 function buildStepModeUserText(
   question: string,
   stepHistory: string[],
@@ -230,13 +266,28 @@ function buildStuckUserText(
   currentStep: string,
   stepHistory: string[],
   clarificationHistory: string[],
-  stillStuck: boolean
+  stillStuck: boolean,
+  currentTarget: HighlightTarget | null,
+  hasImage: boolean
 ): string {
   let text = `The user's goal: "${question}"\n\n`;
   text += `Current step they are stuck on (step ${stepHistory.length + 1}): "${currentStep}"\n\n`;
   text +=
     "SESSION MEMORY — do NOT restart the task. Do NOT repeat completed steps. Clarify ONLY the current step.\n\n";
-  text += "Look at the screenshot carefully.\n\n";
+  if (hasImage) {
+    text += "Look at the screenshot carefully.\n\n";
+  } else {
+    text +=
+      "No screenshot is attached for this clarification. Use only the current step, completed steps, and target details below.\n\n";
+  }
+
+  if (currentTarget) {
+    text += `Existing red-circle target: ${currentTarget.name}`;
+    if (currentTarget.location) {
+      text += `, ${currentTarget.location}`;
+    }
+    text += ". Reuse this same target.\n\n";
+  }
 
   if (stepHistory.length > 0) {
     text += "Steps already completed (do NOT repeat these):\n";
@@ -256,10 +307,10 @@ function buildStuckUserText(
 
   if (stillStuck) {
     text +=
-      "They are STILL stuck. Explain this SAME step even more simply using visual clues from the screenshot. Do not advance. Do not repeat earlier clarifications word-for-word.";
+      "They are STILL stuck. Explain this SAME step even more simply. Do not advance. Do not repeat earlier clarifications word-for-word.";
   } else {
     text +=
-      "They are stuck. Re-explain this SAME step more clearly using colors, position, and icon appearance from the screenshot. Do not advance.";
+      "They are stuck. Re-explain this SAME step more clearly. Do not advance.";
   }
 
   return text;
@@ -288,6 +339,7 @@ export async function POST(request: Request) {
       clarificationHistory,
       isStepMode,
       currentStep,
+      currentHighlight,
       stuckMode,
       isScreenSummary,
     } = body as {
@@ -297,6 +349,7 @@ export async function POST(request: Request) {
       clarificationHistory?: unknown;
       isStepMode?: unknown;
       currentStep?: unknown;
+      currentHighlight?: unknown;
       stuckMode?: unknown;
       isScreenSummary?: unknown;
     };
@@ -326,6 +379,8 @@ export async function POST(request: Request) {
 
       const completion = await ollama.chat.completions.create({
         model: OLLAMA_MODEL,
+        temperature: MODEL_TEMPERATURE,
+        max_tokens: SUMMARY_MAX_TOKENS,
         messages: [
           { role: "system", content: SCREEN_SUMMARY_PROMPT },
           {
@@ -341,8 +396,13 @@ export async function POST(request: Request) {
         ],
       });
 
-      const summary = completion.choices[0]?.message?.content?.trim();
+      const summary = getCompletionText(completion);
       if (!summary) {
+        console.error("Empty screen-summary completion", {
+          model: OLLAMA_MODEL,
+          finishReason: completion.choices[0]?.finish_reason,
+          message: completion.choices[0]?.message,
+        });
         return NextResponse.json(
           { error: "No summary was returned from the language model." },
           { status: 502 }
@@ -390,8 +450,10 @@ export async function POST(request: Request) {
       : [];
     const isStuck = stuckMode === "stuck" || stuckMode === "still_stuck";
     const isStillStuck = stuckMode === "still_stuck";
+    const existingTarget = parseTarget(currentHighlight);
+    const hasImage = typeof image === "string";
 
-    if (inStepMode && typeof image !== "string") {
+    if (inStepMode && !isStuck && !hasImage) {
       return NextResponse.json(
         { error: "Step mode requires a screenshot image." },
         { status: 400 }
@@ -412,13 +474,19 @@ export async function POST(request: Request) {
     let userText = question.trim();
 
     if (inStepMode && isStuck) {
-      systemPrompt = isStillStuck ? STILL_STUCK_PROMPT : STUCK_PROMPT;
+      systemPrompt = hasImage
+        ? isStillStuck
+          ? STILL_STUCK_PROMPT
+          : STUCK_PROMPT
+        : TEXT_ONLY_STUCK_PROMPT;
       userText = buildStuckUserText(
         question.trim(),
         currentStep as string,
         history,
         clarifications,
-        isStillStuck
+        isStillStuck,
+        existingTarget,
+        hasImage
       );
     } else if (inStepMode) {
       systemPrompt = STEP_MODE_PROMPT;
@@ -440,16 +508,24 @@ export async function POST(request: Request) {
       });
     }
 
+    const selectedModel = isStuck && !hasImage ? OLLAMA_TEXT_MODEL : OLLAMA_MODEL;
     const completion = await ollama.chat.completions.create({
-      model: OLLAMA_MODEL,
+      model: selectedModel,
+      temperature: MODEL_TEMPERATURE,
+      max_tokens: STEP_MAX_TOKENS,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userContent },
       ],
     });
 
-    const rawAnswer = completion.choices[0]?.message?.content?.trim();
+    const rawAnswer = getCompletionText(completion);
     if (!rawAnswer) {
+      console.error("Empty analyze completion", {
+        model: selectedModel,
+        finishReason: completion.choices[0]?.finish_reason,
+        message: completion.choices[0]?.message,
+      });
       return NextResponse.json(
         { error: "No answer was returned from the language model." },
         { status: 502 }
@@ -461,11 +537,12 @@ export async function POST(request: Request) {
       const answer = isComplete
         ? "All done. You successfully completed that task."
         : step;
+      const highlight = isStuck && !target ? existingTarget : target;
       return NextResponse.json({
         answer,
         isComplete,
         isClarification: isStuck,
-        highlight: target,
+        highlight,
       });
     }
 

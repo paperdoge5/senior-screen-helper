@@ -3,16 +3,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { classifyUserQuestion } from "@/lib/question-scope";
 
-type SpeechRecognition = any;
-type SpeechRecognitionEvent = any;
-
-declare global {
-  interface Window {
-    SpeechRecognition?: any;
-    webkitSpeechRecognition?: any;
-  }
-}
-
 const EXAMPLE_QUESTIONS = [
   "What am I looking at?",
   "How do I call someone?",
@@ -30,6 +20,30 @@ type ConversationState =
 
 type MicStatus = "idle" | "listening" | "captured" | "error";
 
+type BrowserSpeechRecognitionEvent = {
+  results: {
+    [index: number]: {
+      [index: number]: {
+        transcript?: string;
+      };
+    };
+  };
+};
+
+type BrowserSpeechRecognition = {
+  lang: string;
+  interimResults: boolean;
+  maxAlternatives: number;
+  onstart: (() => void) | null;
+  onend: (() => void) | null;
+  onerror: (() => void) | null;
+  onresult: ((event: BrowserSpeechRecognitionEvent) => void) | null;
+  start: () => void;
+  abort: () => void;
+};
+
+type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
+
 type HighlightTarget = {
   name: string;
   location?: string;
@@ -41,6 +55,11 @@ type StepApiResponse = {
   isComplete?: boolean;
   highlight?: HighlightTarget | null;
 };
+
+const ENABLE_AUTO_SCREEN_SUMMARY = false;
+const MODEL_IMAGE_MAX_DIMENSION = 768;
+const MODEL_IMAGE_TYPE = "image/jpeg";
+const MODEL_IMAGE_QUALITY = 0.82;
 
 function getObjectContainRect(
   containerW: number,
@@ -594,9 +613,12 @@ export default function Home() {
     null
   );
   const [screenshotFile, setScreenshotFile] = useState<File | null>(null);
+  const [optimizedScreenshotDataUrl, setOptimizedScreenshotDataUrl] = useState<
+    string | null
+  >(null);
   const [isListening, setIsListening] = useState(false);
   const [micStatus, setMicStatus] = useState<MicStatus>("idle");
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const [helpResponse, setHelpResponse] = useState<string | null>(null);
   const [isHelpLoading, setIsHelpLoading] = useState(false);
   const [originalQuestion, setOriginalQuestion] = useState<string | null>(null);
@@ -756,17 +778,22 @@ export default function Home() {
       return false;
     }
 
+    const answer = data.answer;
     const complete = Boolean(data.isComplete);
     if (mode === "guiding") {
-      setCurrentStep(complete ? null : data.answer);
+      setCurrentStep(complete ? null : answer);
     } else if (mode === "stuck" || mode === "still_stuck") {
-      setClarificationHistory((prev) => [...prev, data.answer ?? ""]);
+      setClarificationHistory((prev) => [...prev, answer]);
     }
-    setHelpResponse(data.answer);
+    setHelpResponse(answer);
     setIsStepComplete(complete);
     setConversationState(complete ? "complete" : mode);
-    setHighlightTarget(complete ? null : data.highlight ?? null);
-    speakSingleStep(data.answer);
+    setHighlightTarget((previous) => {
+      if (complete) return null;
+      if (data.highlight) return data.highlight;
+      return mode === "guiding" ? null : previous;
+    });
+    speakSingleStep(answer);
     return true;
   }
 
@@ -777,6 +804,74 @@ export default function Home() {
       reader.onerror = reject;
       reader.readAsDataURL(file);
     });
+  }
+
+  async function fileToOptimizedDataUrl(file: File): Promise<string> {
+    if (typeof window === "undefined") {
+      return fileToDataUrl(file);
+    }
+
+    const originalDataUrl = await fileToDataUrl(file);
+    const image = new Image();
+    image.decoding = "async";
+
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = reject;
+      image.src = originalDataUrl;
+    });
+
+    const sourceWidth = image.naturalWidth || image.width;
+    const sourceHeight = image.naturalHeight || image.height;
+
+    if (!sourceWidth || !sourceHeight) {
+      return originalDataUrl;
+    }
+
+    const scale = Math.min(
+      1,
+      MODEL_IMAGE_MAX_DIMENSION / Math.max(sourceWidth, sourceHeight)
+    );
+    const targetWidth = Math.max(1, Math.round(sourceWidth * scale));
+    const targetHeight = Math.max(1, Math.round(sourceHeight * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+
+    const context = canvas.getContext("2d");
+    if (!context) {
+      return originalDataUrl;
+    }
+
+    context.drawImage(image, 0, 0, targetWidth, targetHeight);
+
+    const optimizedDataUrl = await new Promise<string>((resolve) => {
+      canvas.toBlob(
+        (blob) => {
+          if (!blob) {
+            resolve(originalDataUrl);
+            return;
+          }
+
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = () => resolve(originalDataUrl);
+          reader.readAsDataURL(blob);
+        },
+        MODEL_IMAGE_TYPE,
+        MODEL_IMAGE_QUALITY
+      );
+    });
+
+    console.info("Screenshot optimized for model", {
+      originalBytes: file.size,
+      optimizedBytes: Math.round((optimizedDataUrl.length * 3) / 4),
+      sourceSize: `${sourceWidth}x${sourceHeight}`,
+      modelSize: `${targetWidth}x${targetHeight}`,
+    });
+
+    return optimizedDataUrl;
   }
 
   async function fetchScreenSummary(file: File) {
@@ -893,6 +988,7 @@ export default function Home() {
     setScreenshotName(null);
     setScreenshotPreview(null);
     setScreenshotFile(null);
+    setOptimizedScreenshotDataUrl(null);
   }
 
   function handleStartOver() {
@@ -1023,6 +1119,7 @@ export default function Home() {
     setConversationState("guiding");
 
     try {
+      const startedAt = performance.now();
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1034,6 +1131,10 @@ export default function Home() {
           isStepMode: true,
         }),
       });
+      console.info(
+        "Analyze step request took",
+        `${Math.round(performance.now() - startedAt)}ms`
+      );
 
       const result = await parseAnalyzeResponse(response);
       if (result.status === "emergency" || result.status === "non_technology") {
@@ -1067,19 +1168,24 @@ export default function Home() {
     setHighlightTarget(null);
 
     try {
+      const startedAt = performance.now();
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question: originalQuestion,
-          image: originalScreenshot,
           stepHistory,
           clarificationHistory,
           currentStep,
+          currentHighlight: highlightTarget,
           isStepMode: true,
           stuckMode: mode,
         }),
       });
+      console.info(
+        "Analyze stuck request took",
+        `${Math.round(performance.now() - startedAt)}ms`
+      );
 
       const result = await parseAnalyzeResponse(response);
       if (result.status === "emergency" || result.status === "non_technology") {
@@ -1362,24 +1468,30 @@ export default function Home() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    try {
-      if (localStorage.getItem(WELCOME_ACK_KEY) !== "true") {
+    const timer = window.setTimeout(() => {
+      try {
+        if (localStorage.getItem(WELCOME_ACK_KEY) !== "true") {
+          setShowWelcomeCard(true);
+        }
+      } catch {
         setShowWelcomeCard(true);
       }
-    } catch {
-      setShowWelcomeCard(true);
-    }
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    try {
-      if (localStorage.getItem(SCREENSHOT_GUIDE_HIDDEN_KEY) === "true") {
-        setShowScreenshotGuide(false);
+    const timer = window.setTimeout(() => {
+      try {
+        if (localStorage.getItem(SCREENSHOT_GUIDE_HIDDEN_KEY) === "true") {
+          setShowScreenshotGuide(false);
+        }
+      } catch {
+        // Keep guide visible if storage is unavailable.
       }
-    } catch {
-      // Keep guide visible if storage is unavailable.
-    }
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, []);
 
   function handleHideScreenshotGuide() {
@@ -1472,13 +1584,13 @@ export default function Home() {
   useEffect(() => {
     if (typeof window === "undefined" || !window.speechSynthesis) return;
 
-    loadSpeechVoices();
+    const timer = window.setTimeout(loadSpeechVoices, 0);
     window.speechSynthesis.addEventListener("voiceschanged", loadSpeechVoices);
 
     return () => {
+      window.clearTimeout(timer);
       window.speechSynthesis.removeEventListener("voiceschanged", loadSpeechVoices);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -1517,7 +1629,15 @@ export default function Home() {
 
     setScreenshotName(file.name);
     setScreenshotFile(file);
+    setOptimizedScreenshotDataUrl(null);
     setScreenshotPreview(URL.createObjectURL(file));
+
+    const optimizedScreenshotPromise = fileToOptimizedDataUrl(file)
+      .then((dataUrl) => {
+        setOptimizedScreenshotDataUrl(dataUrl);
+        return dataUrl;
+      })
+      .catch(() => fileToDataUrl(file));
 
     const sessionActive =
       isStepMode &&
@@ -1528,7 +1648,7 @@ export default function Home() {
         conversationState === "still_stuck");
 
     if (sessionActive) {
-      void fileToDataUrl(file).then((dataUrl) => {
+      void optimizedScreenshotPromise.then((dataUrl) => {
         setOriginalScreenshot(dataUrl);
       });
       setHighlightTarget(null);
@@ -1538,7 +1658,13 @@ export default function Home() {
       setHighlightTarget(null);
     }
 
-    void fetchScreenSummary(file);
+    if (ENABLE_AUTO_SCREEN_SUMMARY) {
+      void fetchScreenSummary(file);
+    } else {
+      summaryRequestRef.current += 1;
+      setScreenSummary(null);
+      setIsLoadingScreenSummary(false);
+    }
   }
 
   function handleRemoveScreenshot() {
@@ -1551,6 +1677,7 @@ export default function Home() {
     setScreenshotName(null);
     setScreenshotPreview(null);
     setScreenshotFile(null);
+    setOptimizedScreenshotDataUrl(null);
     setHelpResponse(null);
     resetStepMode();
     stopSpeech();
@@ -1570,13 +1697,13 @@ export default function Home() {
       typeof window !== "undefined"
         ? (
             window as Window & {
-              SpeechRecognition?: typeof window.SpeechRecognition;
-              webkitSpeechRecognition?: typeof window.SpeechRecognition;
+              SpeechRecognition?: BrowserSpeechRecognitionConstructor;
+              webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
             }
           ).SpeechRecognition ||
           (
             window as Window & {
-              webkitSpeechRecognition?: typeof window.SpeechRecognition;
+              webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
             }
           ).webkitSpeechRecognition
         : undefined;
@@ -1610,7 +1737,7 @@ export default function Home() {
       recognitionRef.current = null;
     };
 
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
+    recognition.onresult = (event: BrowserSpeechRecognitionEvent) => {
       const transcript = event.results[0]?.[0]?.transcript?.trim();
       if (transcript) {
         setQuestion(transcript);
@@ -1706,8 +1833,10 @@ export default function Home() {
     setHighlightTarget(null);
 
     try {
-      const imageDataUrl = screenshotFile
-        ? await fileToDataUrl(screenshotFile)
+      const imageDataUrl = optimizedScreenshotDataUrl
+        ? optimizedScreenshotDataUrl
+        : screenshotFile
+          ? await fileToOptimizedDataUrl(screenshotFile)
         : undefined;
 
       if (!imageDataUrl) {
@@ -1715,6 +1844,7 @@ export default function Home() {
         return;
       }
 
+      setOptimizedScreenshotDataUrl(imageDataUrl);
       setOriginalQuestion(trimmedQuestion);
       setOriginalScreenshot(imageDataUrl);
       setStepHistory([]);
@@ -1724,6 +1854,7 @@ export default function Home() {
       setIsStepComplete(false);
       setConversationState("guiding");
 
+      const startedAt = performance.now();
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1735,6 +1866,10 @@ export default function Home() {
           isStepMode: true,
         }),
       });
+      console.info(
+        "Analyze first step request took",
+        `${Math.round(performance.now() - startedAt)}ms`
+      );
 
       const result = await parseAnalyzeResponse(response);
       if (result.status === "emergency" || result.status === "non_technology") {
